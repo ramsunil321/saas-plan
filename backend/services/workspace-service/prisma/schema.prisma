@@ -1,0 +1,358 @@
+// =============================================================================
+// FLOWFORGE — COMPLETE PRISMA SCHEMA (workspace-service copy)
+// =============================================================================
+//
+// WHY EVERY SERVICE HAS ITS OWN COPY:
+//   All FlowForge services share ONE PostgreSQL database, but each service
+//   runs its own Prisma Client (generated from its own schema copy).
+//   This is the "shared database, separate schema" microservice pattern.
+//
+//   The db-migrate init container (auth-service/Dockerfile.migrate) is the
+//   single source of truth for migrations — it runs `prisma migrate deploy`
+//   once at startup. All other services just run `prisma generate` to get
+//   their TypeScript client — they do NOT run migrations themselves.
+//
+// INTERVIEW QUESTION: "How do you handle DB schema in a microservices app?"
+//   Answer: One approach is a dedicated migration service (init container)
+//   that applies all migrations before any application service starts.
+//   Services only read/write data — they never own the migration lifecycle.
+//   This prevents race conditions where two services try to migrate simultaneously.
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                   String    @id @default(uuid()) @db.Uuid
+  email                String    @unique @db.VarChar(255)
+  passwordHash         String    @map("password_hash") @db.VarChar(255)
+  firstName            String    @map("first_name") @db.VarChar(100)
+  lastName             String    @map("last_name") @db.VarChar(100)
+  avatarUrl            String?   @map("avatar_url")
+  isVerified           Boolean   @default(false) @map("is_verified")
+  verifyToken          String?   @map("verify_token") @db.VarChar(255)
+  verifyTokenExpiresAt DateTime? @map("verify_token_expires_at") @db.Timestamptz()
+  resetToken           String?   @map("reset_token") @db.VarChar(255)
+  resetTokenExpiresAt  DateTime? @map("reset_token_expires_at") @db.Timestamptz()
+  createdAt            DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt            DateTime  @updatedAt @map("updated_at") @db.Timestamptz()
+
+  refreshTokens        RefreshToken[]
+  organizationMembers  OrganizationMember[]
+  teamMembers          TeamMember[]
+  ownedOrganizations   Organization[]      @relation("OrganizationCreator")
+  reportedTasks        Task[]              @relation("TaskReporter")
+  taskAssignees        TaskAssignee[]
+  comments             Comment[]
+  attachments          Attachment[]
+  activityLogs         ActivityLog[]
+  notifications        Notification[]
+  sentInvitations      Invitation[]        @relation("InvitationInviter")
+
+  @@map("users")
+}
+
+model RefreshToken {
+  id         String   @id @default(uuid()) @db.Uuid
+  userId     String   @map("user_id") @db.Uuid
+  tokenHash  String   @unique @map("token_hash") @db.VarChar(255)
+  expiresAt  DateTime @map("expires_at") @db.Timestamptz()
+  isRevoked  Boolean  @default(false) @map("is_revoked")
+  deviceInfo Json?    @map("device_info")
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([tokenHash])
+  @@map("refresh_tokens")
+}
+
+model Organization {
+  id          String   @id @default(uuid()) @db.Uuid
+  name        String   @db.VarChar(255)
+  slug        String   @unique @db.VarChar(100)
+  logoUrl     String?  @map("logo_url")
+  description String?
+  plan        String   @default("free") @db.VarChar(50)
+  createdBy   String   @map("created_by") @db.Uuid
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz()
+
+  creator      User                 @relation("OrganizationCreator", fields: [createdBy], references: [id])
+  members      OrganizationMember[]
+  teams        Team[]
+  projects     Project[]
+  boards       Board[]
+  tasks        Task[]
+  comments     Comment[]
+  attachments  Attachment[]
+  activityLogs ActivityLog[]
+  notifications Notification[]
+  invitations  Invitation[]
+
+  @@index([slug])
+  @@map("organizations")
+}
+
+model OrganizationMember {
+  id             String   @id @default(uuid()) @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  userId         String   @map("user_id") @db.Uuid
+  role           String   @db.VarChar(50)
+  joinedAt       DateTime @default(now()) @map("joined_at") @db.Timestamptz()
+  invitedBy      String?  @map("invited_by") @db.Uuid
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, userId])
+  @@index([organizationId])
+  @@index([userId])
+  @@map("organization_members")
+}
+
+model Team {
+  id             String   @id @default(uuid()) @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  name           String   @db.VarChar(255)
+  description    String?
+  createdBy      String   @map("created_by") @db.Uuid
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz()
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  members        TeamMember[]
+  projects       Project[]
+
+  @@index([organizationId])
+  @@map("teams")
+}
+
+model TeamMember {
+  id       String   @id @default(uuid()) @db.Uuid
+  teamId   String   @map("team_id") @db.Uuid
+  userId   String   @map("user_id") @db.Uuid
+  role     String   @default("member") @db.VarChar(50)
+  joinedAt DateTime @default(now()) @map("joined_at") @db.Timestamptz()
+
+  team     Team     @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([teamId, userId])
+  @@index([teamId])
+  @@index([userId])
+  @@map("team_members")
+}
+
+model Project {
+  id             String    @id @default(uuid()) @db.Uuid
+  organizationId String    @map("organization_id") @db.Uuid
+  teamId         String?   @map("team_id") @db.Uuid
+  name           String    @db.VarChar(255)
+  description    String?
+  key            String    @db.VarChar(10)
+  status         String    @default("active") @db.VarChar(50)
+  startDate      DateTime? @map("start_date") @db.Date
+  endDate        DateTime? @map("end_date") @db.Date
+  createdBy      String    @map("created_by") @db.Uuid
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz()
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  team           Team?        @relation(fields: [teamId], references: [id], onDelete: SetNull)
+  boards         Board[]
+  tasks          Task[]
+
+  @@unique([organizationId, key])
+  @@index([organizationId])
+  @@index([teamId])
+  @@map("projects")
+}
+
+model Board {
+  id             String   @id @default(uuid()) @db.Uuid
+  projectId      String   @map("project_id") @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  name           String   @db.VarChar(100)
+  position       Int
+  color          String?  @db.VarChar(7)
+  isDefault      Boolean  @default(false) @map("is_default")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz()
+
+  project        Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  tasks          Task[]
+
+  @@index([projectId])
+  @@index([organizationId])
+  @@map("boards")
+}
+
+model Task {
+  id             String    @id @default(uuid()) @db.Uuid
+  organizationId String    @map("organization_id") @db.Uuid
+  projectId      String    @map("project_id") @db.Uuid
+  boardId        String    @map("board_id") @db.Uuid
+  title          String    @db.VarChar(500)
+  description    String?
+  taskNumber     Int       @map("task_number")
+  priority       String    @default("medium") @db.VarChar(20)
+  status         String    @default("todo") @db.VarChar(50)
+  dueDate        DateTime? @map("due_date") @db.Date
+  reporterId     String    @map("reporter_id") @db.Uuid
+  position       Float     @default(0)
+  estimatedHours Decimal?  @map("estimated_hours") @db.Decimal(6, 2)
+  actualHours    Decimal?  @map("actual_hours") @db.Decimal(6, 2)
+  parentTaskId   String?   @map("parent_task_id") @db.Uuid
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz()
+
+  organization   Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  project        Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  board          Board         @relation(fields: [boardId], references: [id])
+  reporter       User          @relation("TaskReporter", fields: [reporterId], references: [id])
+  parentTask     Task?         @relation("SubTasks", fields: [parentTaskId], references: [id])
+  subTasks       Task[]        @relation("SubTasks")
+  assignees      TaskAssignee[]
+  comments       Comment[]
+  attachments    Attachment[]
+  activityLogs   ActivityLog[]
+
+  @@unique([projectId, taskNumber])
+  @@index([organizationId])
+  @@index([projectId])
+  @@index([boardId])
+  @@index([reporterId])
+  @@index([dueDate])
+  @@index([status])
+  @@map("tasks")
+}
+
+model TaskAssignee {
+  id         String   @id @default(uuid()) @db.Uuid
+  taskId     String   @map("task_id") @db.Uuid
+  userId     String   @map("user_id") @db.Uuid
+  assignedBy String?  @map("assigned_by") @db.Uuid
+  assignedAt DateTime @default(now()) @map("assigned_at") @db.Timestamptz()
+
+  task       Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([taskId, userId])
+  @@index([taskId])
+  @@index([userId])
+  @@map("task_assignees")
+}
+
+model Comment {
+  id             String   @id @default(uuid()) @db.Uuid
+  taskId         String   @map("task_id") @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  authorId       String   @map("author_id") @db.Uuid
+  content        String
+  parentId       String?  @map("parent_id") @db.Uuid
+  isEdited       Boolean  @default(false) @map("is_edited")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz()
+
+  task          Task         @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  organization  Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  author        User         @relation(fields: [authorId], references: [id])
+  parentComment Comment?     @relation("CommentReplies", fields: [parentId], references: [id])
+  replies       Comment[]    @relation("CommentReplies")
+
+  @@index([taskId])
+  @@index([organizationId])
+  @@map("comments")
+}
+
+model Attachment {
+  id             String   @id @default(uuid()) @db.Uuid
+  taskId         String   @map("task_id") @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  uploadedBy     String   @map("uploaded_by") @db.Uuid
+  fileName       String   @map("file_name") @db.VarChar(255)
+  fileSize       BigInt   @map("file_size")
+  mimeType       String   @map("mime_type") @db.VarChar(100)
+  storageKey     String   @map("storage_key")
+  storageUrl     String   @map("storage_url")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  task           Task         @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  uploader       User         @relation(fields: [uploadedBy], references: [id])
+
+  @@index([taskId])
+  @@map("attachments")
+}
+
+model ActivityLog {
+  id             String   @id @default(uuid()) @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  taskId         String?  @map("task_id") @db.Uuid
+  entityType     String   @map("entity_type") @db.VarChar(50)
+  entityId       String   @map("entity_id") @db.Uuid
+  action         String   @db.VarChar(100)
+  actorId        String   @map("actor_id") @db.Uuid
+  metadata       Json?
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  task           Task?        @relation(fields: [taskId], references: [id], onDelete: SetNull)
+  actor          User         @relation(fields: [actorId], references: [id])
+
+  @@index([organizationId])
+  @@index([taskId])
+  @@index([entityType, entityId])
+  @@index([actorId])
+  @@index([createdAt(sort: Desc)])
+  @@map("activity_logs")
+}
+
+model Notification {
+  id             String    @id @default(uuid()) @db.Uuid
+  organizationId String    @map("organization_id") @db.Uuid
+  recipientId    String    @map("recipient_id") @db.Uuid
+  type           String    @db.VarChar(100)
+  title          String    @db.VarChar(255)
+  message        String
+  metadata       Json?
+  isRead         Boolean   @default(false) @map("is_read")
+  readAt         DateTime? @map("read_at") @db.Timestamptz()
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  recipient      User         @relation(fields: [recipientId], references: [id], onDelete: Cascade)
+
+  @@index([recipientId])
+  @@index([organizationId])
+  @@index([recipientId, isRead])
+  @@map("notifications")
+}
+
+model Invitation {
+  id             String    @id @default(uuid()) @db.Uuid
+  organizationId String    @map("organization_id") @db.Uuid
+  email          String    @db.VarChar(255)
+  role           String    @db.VarChar(50)
+  token          String    @unique @db.VarChar(255)
+  invitedBy      String    @map("invited_by") @db.Uuid
+  expiresAt      DateTime  @map("expires_at") @db.Timestamptz()
+  acceptedAt     DateTime? @map("accepted_at") @db.Timestamptz()
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  inviter        User         @relation("InvitationInviter", fields: [invitedBy], references: [id])
+
+  @@index([token])
+  @@index([email])
+  @@map("invitations")
+}

@@ -1,0 +1,355 @@
+# =============================================================================
+# FLOWFORGE — Docker Compose Orchestration
+# =============================================================================
+#
+# SERVICES (startup order enforced by depends_on + healthchecks):
+#
+#   1. postgres        — shared PostgreSQL database (all services use one DB)
+#   2. redis           — shared Redis cache (notification badge counts, workspace cache)
+#   3. rabbitmq        — message broker (workspace + task publish, notification consumes)
+#   4. db-migrate      — runs prisma migrate deploy ONCE then exits
+#   5. auth-service    — JWT auth, user management (port 3001)
+#   6. workspace-service — orgs, teams, projects, boards (port 3002)
+#   7. task-service    — tasks, comments, file uploads (port 3003)
+#   8. notification-service — event consumer + notification API (port 3004)
+#   9. frontend        — Next.js 15 (port 3000, served via nginx)
+#  10. nginx           — reverse proxy, routes all traffic (port 80)
+#
+# STARTUP ORDER GUARANTEE (docker-compose depends_on conditions):
+#   - `service_healthy`:              wait for healthy healthcheck
+#   - `service_completed_successfully`: wait for service to exit with code 0
+#
+# INTERVIEW QUESTION: "How do you ensure service startup order in Docker Compose?"
+#   Answer: `depends_on` with `condition: service_healthy` or
+#   `condition: service_completed_successfully`. This makes Docker Compose
+#   wait for the dependency's healthcheck to pass before starting the dependent
+#   service. Without this, services start in parallel and crash if their
+#   dependencies (DB, Redis) aren't ready yet.
+#
+# NETWORKING:
+#   All services are on the `flowforge` bridge network. Service names resolve
+#   to container IPs via Docker's embedded DNS (e.g., `postgres` → postgres container).
+#   Only nginx (port 80) and the dev ports (3001-3004) are exposed to the host.
+#
+# VOLUMES:
+#   Named volumes persist data across `docker-compose down` (without --volumes).
+#   `docker-compose down --volumes` removes all data (use for a clean slate).
+# =============================================================================
+
+services:
+
+  # ===========================================================================
+  # INFRASTRUCTURE
+  # ===========================================================================
+
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-flowforge}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-flowforge123}
+      POSTGRES_DB: ${POSTGRES_DB:-flowforge}
+    volumes:
+      # Named volume — data persists across restarts and `docker-compose down`
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - flowforge
+    healthcheck:
+      # pg_isready: built-in Postgres tool that checks if the server accepts connections
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-flowforge} -d ${POSTGRES_DB:-flowforge}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    # Expose to host only in development (for tools like DBeaver, Prisma Studio)
+    # Remove this in production — the DB should not be publicly accessible
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --save 60 1 --loglevel warning
+    #  ^ `--save 60 1` = snapshot every 60s if ≥1 key changed (persistence)
+    #    `--loglevel warning` = reduce noise in logs
+    volumes:
+      - redis_data:/data
+    networks:
+      - flowforge
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "6379:6379"
+
+  rabbitmq:
+    image: rabbitmq:3.12-management-alpine
+    # `management` variant includes the RabbitMQ Management UI at port 15672
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-flowforge}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-flowforge123}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - flowforge
+    healthcheck:
+      # rabbitmq-diagnostics ping: lightweight check that the broker is alive
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s    # RabbitMQ takes ~20s to fully boot
+    ports:
+      - "5672:5672"        # AMQP protocol port
+      - "15672:15672"      # Management UI — http://localhost:15672
+
+  # ===========================================================================
+  # DB MIGRATIONS — Runs once, then exits
+  # ===========================================================================
+  # This init container applies all pending Prisma migrations before any
+  # backend service starts. All backend services depend on this completing
+  # successfully (condition: service_completed_successfully).
+  #
+  # If a migration fails, the container exits with code 1 — all dependent
+  # services abort. This prevents services from running against a stale schema.
+  # ===========================================================================
+
+  db-migrate:
+    build:
+      context: ./backend/services/auth-service
+      dockerfile: Dockerfile.migrate
+    restart: "no"    # never restart — it should run exactly once and exit
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-flowforge}:${POSTGRES_PASSWORD:-flowforge123}@postgres:5432/${POSTGRES_DB:-flowforge}
+    networks:
+      - flowforge
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ===========================================================================
+  # BACKEND SERVICES
+  # ===========================================================================
+
+  auth-service:
+    build:
+      context: ./backend/services/auth-service
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      PORT: 3001
+      DATABASE_URL: postgresql://${POSTGRES_USER:-flowforge}:${POSTGRES_PASSWORD:-flowforge123}@postgres:5432/${POSTGRES_DB:-flowforge}
+      REDIS_URL: redis://redis:6379
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:-${JWT_ACCESS_SECRET}}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost}
+    networks:
+      - flowforge
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:3001/health', r => process.exit(r.statusCode === 200 ? 0 : 1))\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    ports:
+      - "3001:3001"    # Exposed for direct API testing; remove in strict production
+
+  workspace-service:
+    build:
+      context: ./backend/services/workspace-service
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      PORT: 3002
+      DATABASE_URL: postgresql://${POSTGRES_USER:-flowforge}:${POSTGRES_PASSWORD:-flowforge123}@postgres:5432/${POSTGRES_DB:-flowforge}
+      REDIS_URL: redis://redis:6379
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-flowforge}:${RABBITMQ_PASSWORD:-flowforge123}@rabbitmq:5672
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost}
+    networks:
+      - flowforge
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:3002/health', r => process.exit(r.statusCode === 200 ? 0 : 1))\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    ports:
+      - "3002:3002"
+
+  task-service:
+    build:
+      context: ./backend/services/task-service
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      PORT: 3003
+      DATABASE_URL: postgresql://${POSTGRES_USER:-flowforge}:${POSTGRES_PASSWORD:-flowforge123}@postgres:5432/${POSTGRES_DB:-flowforge}
+      REDIS_URL: redis://redis:6379
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-flowforge}:${RABBITMQ_PASSWORD:-flowforge123}@rabbitmq:5672
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET}
+      MAX_FILE_SIZE_MB: 20
+      UPLOAD_DIR: /app/uploads
+    volumes:
+      # Uploaded files persisted across restarts (local disk → swap to S3 in production)
+      - uploads_data:/app/uploads
+    networks:
+      - flowforge
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:3003/health', r => process.exit(r.statusCode === 200 ? 0 : 1))\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    ports:
+      - "3003:3003"
+
+  notification-service:
+    build:
+      context: ./backend/services/notification-service
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      PORT: 3004
+      DATABASE_URL: postgresql://${POSTGRES_USER:-flowforge}:${POSTGRES_PASSWORD:-flowforge123}@postgres:5432/${POSTGRES_DB:-flowforge}
+      REDIS_URL: redis://redis:6379
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-flowforge}:${RABBITMQ_PASSWORD:-flowforge123}@rabbitmq:5672
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost}
+      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      EMAIL_FROM: ${EMAIL_FROM:-noreply@flowforge.io}
+      CONSUMER_PREFETCH: 1
+    networks:
+      - flowforge
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:3004/health', r => process.exit(r.statusCode === 200 ? 0 : 1))\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    ports:
+      - "3004:3004"
+
+  # ===========================================================================
+  # FRONTEND (Next.js 15)
+  # ===========================================================================
+  # All NEXT_PUBLIC_* API URLs point to the same nginx origin (http://localhost).
+  # nginx routes to the correct backend service by URL path.
+  # These are BUILD ARGS — baked into the JS bundle at build time.
+  # ===========================================================================
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # All API calls go through nginx → nginx routes by path
+        NEXT_PUBLIC_AUTH_API_URL: http://localhost/api/v1
+        NEXT_PUBLIC_WORKSPACE_API_URL: http://localhost/api/v1
+        NEXT_PUBLIC_TASK_API_URL: http://localhost/api/v1
+        NEXT_PUBLIC_NOTIFICATION_API_URL: http://localhost/api/v1
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+    networks:
+      - flowforge
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:3000', r => process.exit(r.statusCode < 500 ? 0 : 1))\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s    # Next.js cold start can be slow on first request
+
+  # ===========================================================================
+  # NGINX — Reverse proxy (the only public-facing service in production)
+  # ===========================================================================
+  # In production, ONLY port 80 (and 443 with TLS) should be exposed.
+  # The individual service ports (3001-3004) should NOT be exposed externally.
+  # ===========================================================================
+
+  nginx:
+    build:
+      context: ./nginx
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "80:80"       # HTTP — the main entry point
+      # - "443:443"   # HTTPS — uncomment when you add TLS certs
+    networks:
+      - flowforge
+    depends_on:
+      auth-service:
+        condition: service_healthy
+      workspace-service:
+        condition: service_healthy
+      task-service:
+        condition: service_healthy
+      notification-service:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+
+# =============================================================================
+# NETWORKS — Isolated bridge network for all FlowForge services
+# =============================================================================
+# Services on the same network can reach each other by service name.
+# Services NOT on this network cannot reach internal services.
+# =============================================================================
+
+networks:
+  flowforge:
+    driver: bridge
+
+# =============================================================================
+# VOLUMES — Persistent storage that survives container restarts
+# =============================================================================
+# `docker-compose down` keeps volumes (data persists).
+# `docker-compose down --volumes` deletes volumes (fresh start).
+# =============================================================================
+
+volumes:
+  postgres_data:
+    driver: local    # Local disk — replace with a managed volume in production
+  redis_data:
+    driver: local
+  rabbitmq_data:
+    driver: local
+  uploads_data:
+    driver: local    # Task attachments — replace with S3 in production

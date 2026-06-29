@@ -1,0 +1,36 @@
+# =============================================================================
+# MIGRATION DOCKERFILE — Runs Prisma migrations as a one-shot init container
+# =============================================================================
+#
+# WHY A SEPARATE DOCKERFILE FOR MIGRATIONS?
+#   The production image uses `npm ci --only=production`, which means the
+#   `prisma` CLI (a devDependency) is NOT available at runtime.
+#   We need ALL dependencies (including prisma CLI) to run migrations.
+#   This image is built from the builder stage so it has devDependencies.
+#
+# HOW IT'S USED IN DOCKER COMPOSE:
+#   The `db-migrate` service uses this Dockerfile.
+#   It runs ONCE at startup, applies all pending migrations, then exits.
+#   All backend services `depends_on: db-migrate: condition: service_completed_successfully`.
+#   If migration fails (exit code != 0), all dependent services abort startup.
+#
+# INTERVIEW QUESTION: "How do you handle DB migrations in a containerised app?"
+#   Answer: Use an init container that runs migrations before the app starts.
+#   In Kubernetes, this is a Pod initContainer. In docker-compose, it's a
+#   service with `restart: "no"` that other services depend on via
+#   `condition: service_completed_successfully`. This ensures the schema is
+#   always up to date before any service connects.
+# =============================================================================
+
+FROM node:20-alpine
+WORKDIR /app
+
+# Install ALL dependencies (including prisma CLI)
+COPY package*.json ./
+COPY prisma ./prisma/
+RUN npm ci
+
+# `prisma migrate deploy` applies all pending migrations in order
+# It is safe to run multiple times (idempotent — skips already-applied migrations)
+# It uses the DATABASE_URL env var (passed at runtime via docker-compose)
+CMD ["npx", "prisma", "migrate", "deploy"]

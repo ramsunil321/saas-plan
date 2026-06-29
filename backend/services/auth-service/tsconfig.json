@@ -1,0 +1,45 @@
+{
+  "compilerOptions": {
+    // Target: ES2022 supports top-level await, modern class features
+    "target": "ES2022",
+    // Module: CommonJS for Node.js (not ESM, which requires file extensions in imports)
+    "module": "commonjs",
+    // Module resolution: how TypeScript finds imported modules
+    "moduleResolution": "node",
+    // Output directory for compiled JavaScript
+    "outDir": "./dist",
+    // Root directory (all source files must be inside src/)
+    "rootDir": "./src",
+    // Strict mode: enables all strict type-checking options
+    // INTERVIEW QUESTION: "Why use strict: true?"
+    // Answer: Catches common bugs at compile time: undefined checks,
+    // implicit any, unused variables. Think of it as ESLint but for types.
+    "strict": true,
+    // Enable decorators (needed if you add frameworks like TypeORM later)
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
+    // Source maps: allow debuggers to map compiled JS back to TypeScript source
+    "sourceMap": true,
+    // Skip type checking for declaration files in node_modules (faster build)
+    "skipLibCheck": true,
+    // Allow importing CommonJS modules with 'import x from "module"'
+    "esModuleInterop": true,
+    // Allow synthetic default imports (implied by esModuleInterop)
+    "allowSyntheticDefaultImports": true,
+    // Resolve JSON imports (import config from './config.json')
+    "resolveJsonModule": true,
+    // Force consistent casing in file names (prevents bugs on case-insensitive OS)
+    "forceConsistentCasingInFileNames": true,
+    // Declaration files: generate .d.ts files (useful if this becomes a library)
+    "declaration": true,
+    "declarationMap": true,
+    // No unused locals (enforce clean code)
+    "noUnusedLocals": false,
+    // No unused parameters
+    "noUnusedParameters": false,
+    // Error on implicit returns (functions must return in all branches)
+    "noImplicitReturns": true
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist", "tests"]
+}
